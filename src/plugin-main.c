@@ -543,13 +543,32 @@ static obs_properties_t *pipewire_video_capture_get_properties(void *data)
 
 static void pipewire_video_capture_update(void *data, obs_data_t *settings)
 {
-	UNUSED_PARAMETER(settings);
 	struct pipewire_video_capture *capture = data;
+	const char *target_name;
+	ssize_t idx;
 
 	capture->double_buffering = obs_data_get_bool(settings, "DoubleBuffering");
 
 	if (capture->obs_pw_stream)
 		obs_pipewire_stream_set_double_buffering(capture->obs_pw_stream, capture->double_buffering);
+
+	target_name = obs_data_get_string(settings, "target");
+
+	pthread_mutex_lock(&capture->targets_lock);
+	idx = find_target(capture, target_name);
+
+	if (idx >= 0) {
+		capture->cur_target = idx;
+		update_pipewire_target(capture);
+	} else {
+		capture->cur_target = -1;
+		capture->cur_unique = true;
+		if (capture->obs_pw_stream)
+			obs_pipewire_stream_set_target(capture->obs_pw_stream,
+						       (target_name && target_name[0]) ? target_name : NULL);
+	}
+
+	pthread_mutex_unlock(&capture->targets_lock);
 }
 
 static void pipewire_video_capture_show(void *data)
