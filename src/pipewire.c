@@ -29,6 +29,9 @@
 #include <util/dstr.h>
 
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <string.h>
 #include <unistd.h>
 //#include <glad/glad.h>
 #include <libdrm/drm_fourcc.h>
@@ -759,6 +762,9 @@ static void set_target(void *data, uint64_t expirations)
 	pthread_mutex_lock(&obs_pw_stream->cfg_lock);
 	pw_properties_set(props, PW_KEY_TARGET_OBJECT, obs_pw_stream->target);
 	pw_properties_set(props, PW_KEY_NODE_AUTOCONNECT, obs_pw_stream->target ? "true" : "false");
+	pw_properties_set(props, "node.dont-fallback", "true");
+	pw_properties_set(props, "node.dont-reconnect", "true");
+	pw_properties_set(props, "node.dont-move", "true");
 	pthread_mutex_unlock(&obs_pw_stream->cfg_lock);
 
 	pthread_mutex_lock(&obs_pw_stream->state_lock);
@@ -850,6 +856,67 @@ static uint32_t get_spa_buffer_plane_count(const struct spa_buffer *buffer)
 	}
 
 	return plane_count;
+}
+
+static bool map_single_plane_buffer(const struct spa_buffer *buffer, uint32_t width, uint32_t height, uint32_t bpp,
+				    const uint8_t **texture_data, void **mapped_data, size_t *mapped_size,
+				    uint8_t **packed_copy)
+{
+	struct spa_data *data = &buffer->datas[0];
+	size_t tight_stride;
+	size_t source_stride;
+	size_t expected_size;
+	size_t map_length;
+	uint8_t *base_ptr = NULL;
+
+	*texture_data = NULL;
+	*mapped_data = NULL;
+	*mapped_size = 0;
+	*packed_copy = NULL;
+
+	tight_stride = (size_t)width * bpp;
+	source_stride = data->chunk->stride > 0 ? (size_t)data->chunk->stride : tight_stride;
+	expected_size = source_stride * height;
+
+	switch (data->type) {
+	case SPA_DATA_MemPtr:
+		base_ptr = data->data;
+		break;
+	case SPA_DATA_MemFd:
+		map_length = data->maxsize > 0 ? (size_t)data->maxsize : data->chunk->offset + expected_size;
+		if (map_length < data->chunk->offset + expected_size)
+			map_length = data->chunk->offset + expected_size;
+		*mapped_data = mmap(NULL, map_length, PROT_READ, MAP_PRIVATE, data->fd, 0);
+		if (*mapped_data == MAP_FAILED) {
+			blog(LOG_ERROR, "[pipewire] Failed to mmap MemFd buffer: %s", strerror(errno));
+			*mapped_data = NULL;
+			return false;
+		}
+		*mapped_size = map_length;
+		base_ptr = *mapped_data;
+		break;
+	default:
+		blog(LOG_ERROR, "[pipewire] unsupported memory buffer type: %u", data->type);
+		return false;
+	}
+
+	if (!base_ptr) {
+		blog(LOG_ERROR, "[pipewire] Failed to access mapped buffer data");
+		return false;
+	}
+
+	base_ptr += data->chunk->offset;
+	if (source_stride == tight_stride) {
+		*texture_data = base_ptr;
+		return true;
+	}
+
+	*packed_copy = bmalloc(tight_stride * height);
+	for (uint32_t row = 0; row < height; row++) {
+		memcpy(*packed_copy + row * tight_stride, base_ptr + row * source_stride, tight_stride);
+	}
+	*texture_data = *packed_copy;
+	return true;
 }
 
 static enum video_colorspace video_colorspace_from_spa_color_matrix(enum spa_video_color_matrix matrix)
@@ -992,12 +1059,10 @@ static void import_dmabuf(obs_pipewire_stream *obs_pw_stream, struct pw_buffer *
 		}
 
 		use_modifiers = obs_pw_stream->format.info.raw.modifier != DRM_FORMAT_MOD_INVALID;
-		blog(LOG_INFO, "[pipewire] Importing dmabuf early");
 		gs_texture_t *texture = gs_texture_create_from_dmabuf(
 			obs_pw_stream->format.info.raw.size.width, obs_pw_stream->format.info.raw.size.height,
 			obs_pw_video_format.drm_format, obs_pw_video_format.gs_format, planes, fds, strides, offsets,
 			use_modifiers ? modifiers : NULL);
-
 		b->user_data = texture;
 	}
 }
@@ -1083,6 +1148,10 @@ static void prepare_sync_buffer(obs_pipewire_stream *obs_pw_stream, struct prese
 		}
 	} else {
 		blog(LOG_DEBUG, "[pipewire] Buffer has memory texture");
+		const uint8_t *texture_data = NULL;
+		void *mapped_data = NULL;
+		size_t mapped_size = 0;
+		uint8_t *packed_copy = NULL;
 
 		if (!obs_pw_video_format_from_spa_format(obs_pw_stream->format.info.raw.format, &obs_pw_video_format) ||
 		    obs_pw_video_format.gs_format == GS_UNKNOWN) {
@@ -1101,10 +1170,18 @@ static void prepare_sync_buffer(obs_pipewire_stream *obs_pw_stream, struct prese
 			goto read_metadata;
 		}
 
+		if (!map_single_plane_buffer(buffer, obs_pw_stream->format.info.raw.size.width,
+					    obs_pw_stream->format.info.raw.size.height, obs_pw_video_format.bpp,
+					    &texture_data, &mapped_data, &mapped_size, &packed_copy)) {
+			goto read_metadata;
+		}
+
 		pb->texture = gs_texture_create(obs_pw_stream->format.info.raw.size.width,
 						obs_pw_stream->format.info.raw.size.height,
-						obs_pw_video_format.gs_format, 1,
-						(const uint8_t **)&buffer->datas[0].data, GS_DYNAMIC);
+						obs_pw_video_format.gs_format, 1, &texture_data, GS_DYNAMIC);
+		bfree(packed_copy);
+		if (mapped_data)
+			munmap(mapped_data, mapped_size);
 	}
 
 	if (obs_pw_video_format.swap_red_blue)
@@ -1337,7 +1414,7 @@ static void on_param_changed_cb(void *user_data, uint32_t id, const struct spa_p
 
 	output_flags = obs_source_get_output_flags(obs_pw_stream->source);
 
-	buffer_types = 1 << SPA_DATA_MemPtr;
+	buffer_types = (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd);
 	bool has_modifier = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) != NULL;
 	if ((has_modifier || check_pw_version(&obs_pw->server_version, 0, 3, 24)) &&
 	    (output_flags & OBS_SOURCE_ASYNC_VIDEO) != OBS_SOURCE_ASYNC_VIDEO) {
@@ -1639,6 +1716,8 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 
 		// Do not try a random video device if source not found
 		pw_properties_set(connect_info->stream_properties, "node.dont-fallback", "true");
+		pw_properties_set(connect_info->stream_properties, "node.dont-reconnect", "true");
+		pw_properties_set(connect_info->stream_properties, "node.dont-move", "true");
 		// Do not destroy the node if source not found
 		pw_properties_set(connect_info->stream_properties, "node.linger", "true");
 	}
