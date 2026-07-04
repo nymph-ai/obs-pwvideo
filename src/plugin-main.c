@@ -292,6 +292,8 @@ static void *pipewire_video_capture_create(obs_data_t *settings, obs_source_t *s
 	UNUSED_PARAMETER(settings);
 	struct pipewire_video_capture *capture;
 	struct obs_pipwire_connect_stream_info connect_info;
+	struct obs_video_info video_info;
+	struct spa_fraction preferred_framerate = {0};
 
 	capture = bzalloc(sizeof(struct pipewire_video_capture));
 	capture->source = source;
@@ -325,7 +327,19 @@ static void *pipewire_video_capture_create(obs_data_t *settings, obs_source_t *s
 				.cursor_visible = false,
 			},
 		.double_buffering = capture->double_buffering,
+		.video =
+			{
+				.resolution = NULL,
+				.framerate = NULL,
+			},
 	};
+
+	if (obs_get_video_info(&video_info)) {
+		preferred_framerate.num = video_info.fps_num;
+		preferred_framerate.denom = video_info.fps_den;
+		if (preferred_framerate.num > 0 && preferred_framerate.denom > 0)
+			connect_info.video.framerate = &preferred_framerate;
+	}
 
 	dstr_free(&node_name);
 
